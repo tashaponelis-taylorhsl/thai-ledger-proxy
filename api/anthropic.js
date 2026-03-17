@@ -1,20 +1,26 @@
 export const config = { runtime: "edge" };
 
 export default async function handler(req) {
-  const origin = req.headers.get("origin") || "";
   const corsHeaders = {
     "Access-Control-Allow-Origin": "https://tashaponelis-taylorhsl.github.io",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, x-api-key, anthropic-version",
     "Content-Type": "application/json",
   };
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
   if (req.method !== "POST") return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: corsHeaders });
+
   try {
     const body = await req.json();
+    const apiKey = req.headers.get("x-api-key") || process.env.ANTHROPIC_API_KEY;
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
       body: JSON.stringify(body),
     });
     const data = await response.json();
