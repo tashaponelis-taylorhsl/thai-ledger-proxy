@@ -15,7 +15,24 @@ export default async function handler(req) {
   try {
     const { token, realmId, method, path, body, env } = await req.json();
     const base = env === "production" ? QBO_BASE_PROD : QBO_BASE_SANDBOX;
-    const url = `${base}/${realmId}${path}`;
+
+    // minorversion=75 required for QBO Advanced custom fields
+    // include=enhancedAllCustomFields required to read/write Advanced custom fields
+    const separator = path.includes("?") ? "&" : "?";
+    let fullPath = `${path}${separator}minorversion=75`;
+
+    // Add enhancedAllCustomFields for purchase and bill endpoints
+    const isWriteToTransaction = (method === "POST" || method === "PUT") && 
+      (path.includes("/purchase") || path.includes("/bill") || path.includes("/journalentry"));
+    const isReadTransaction = method === "GET" && 
+      (path.includes("/purchase") || path.includes("/bill") || path.includes("query"));
+    
+    if (isWriteToTransaction || isReadTransaction) {
+      fullPath += "&include=enhancedAllCustomFields";
+    }
+
+    const url = `${base}/${realmId}${fullPath}`;
+    console.log("QBO URL:", url);
 
     const fetchOpts = {
       method: method || "GET",
@@ -29,19 +46,15 @@ export default async function handler(req) {
 
     const response = await fetch(url, fetchOpts);
 
-    // Capture intuit_tid from response headers for troubleshooting
+    // Capture intuit_tid for troubleshooting
     const intuitTid = response.headers.get("intuit_tid") || 
-                      response.headers.get("Intuit-Tid") || 
-                      null;
+                      response.headers.get("Intuit-Tid") || null;
 
     const data = await response.json();
-
-    // Include intuit_tid in response for error logging
     if (intuitTid) data._intuit_tid = intuitTid;
 
-    // Log errors with intuit_tid for troubleshooting
     if (!response.ok) {
-      console.error(`QBO API Error: ${response.status} | intuit_tid: ${intuitTid} | path: ${path} | realmId: ${realmId}`);
+      console.error(`QBO API Error: ${response.status} | intuit_tid: ${intuitTid} | path: ${path}`);
     }
 
     return new Response(JSON.stringify(data), { status: response.status, headers: corsHeaders });
