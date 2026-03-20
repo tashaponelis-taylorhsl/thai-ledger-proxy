@@ -16,23 +16,18 @@ export default async function handler(req) {
     const { token, realmId, method, path, body, env } = await req.json();
     const base = env === "production" ? QBO_BASE_PROD : QBO_BASE_SANDBOX;
 
-    // minorversion=75 required for QBO Advanced custom fields
-    // include=enhancedAllCustomFields required to read/write Advanced custom fields
+    // minorversion=75 for QBO Advanced custom fields support
     const separator = path.includes("?") ? "&" : "?";
     let fullPath = `${path}${separator}minorversion=75`;
 
-    // Add enhancedAllCustomFields for purchase and bill endpoints
-    const isWriteToTransaction = (method === "POST" || method === "PUT") && 
-      (path.includes("/purchase") || path.includes("/bill") || path.includes("/journalentry"));
-    const isReadTransaction = method === "GET" && 
-      (path.includes("/purchase") || path.includes("/bill") || path.includes("query"));
-    
-    if (isWriteToTransaction || isReadTransaction) {
+    // Only add enhancedAllCustomFields for direct purchase/bill reads and writes
+    // NOT for query endpoints as it causes 404s
+    const isPurchasePath = path.match(/^\/(purchase|bill)(\/\d+)?$/i);
+    if (isPurchasePath) {
       fullPath += "&include=enhancedAllCustomFields";
     }
 
     const url = `${base}/${realmId}${fullPath}`;
-    console.log("QBO URL:", url);
 
     const fetchOpts = {
       method: method || "GET",
@@ -46,7 +41,6 @@ export default async function handler(req) {
 
     const response = await fetch(url, fetchOpts);
 
-    // Capture intuit_tid for troubleshooting
     const intuitTid = response.headers.get("intuit_tid") || 
                       response.headers.get("Intuit-Tid") || null;
 
