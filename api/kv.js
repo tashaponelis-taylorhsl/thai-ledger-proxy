@@ -15,41 +15,44 @@ export default async function handler(req) {
     const token = process.env.KV_REST_API_TOKEN;
 
     if (!baseUrl || !token) {
-      return new Response(JSON.stringify({ error: "KV not configured" }), { status: 500, headers: corsHeaders });
+      return new Response(JSON.stringify({ error: "KV not configured — check environment variables" }), { status: 500, headers: corsHeaders });
     }
 
-    let url, body, method;
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    let response;
 
     switch (action) {
       case "get":
-        url = `${baseUrl}/get/${encodeURIComponent(key)}`;
-        method = "GET";
+        // Upstash REST: GET /get/key
+        response = await fetch(`${baseUrl}/get/${encodeURIComponent(key)}`, {
+          method: "GET",
+          headers,
+        });
         break;
+
       case "set":
-        url = `${baseUrl}/set/${encodeURIComponent(key)}`;
-        method = "POST";
-        body = JSON.stringify(value);
+        // Upstash REST: POST /set/key with value in body as array [value]
+        response = await fetch(`${baseUrl}/set/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify([value]),
+        });
         break;
+
       case "del":
-        url = `${baseUrl}/del/${encodeURIComponent(key)}`;
-        method = "POST";
+        response = await fetch(`${baseUrl}/del/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers,
+        });
         break;
-      case "keys":
-        url = `${baseUrl}/keys/${encodeURIComponent(key)}*`;
-        method = "GET";
-        break;
+
       default:
         return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400, headers: corsHeaders });
     }
-
-    const response = await fetch(url, {
-      method,
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      ...(body ? { body } : {}),
-    });
 
     const data = await response.json();
     return new Response(JSON.stringify(data), { status: response.status, headers: corsHeaders });
