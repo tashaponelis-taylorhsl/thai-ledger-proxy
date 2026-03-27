@@ -15,7 +15,7 @@ export default async function handler(req) {
     const token = process.env.KV_REST_API_TOKEN;
 
     if (!baseUrl || !token) {
-      return new Response(JSON.stringify({ error: "KV not configured — check environment variables" }), { status: 500, headers: corsHeaders });
+      return new Response(JSON.stringify({ error: "KV not configured" }), { status: 500, headers: corsHeaders });
     }
 
     const headers = {
@@ -27,26 +27,22 @@ export default async function handler(req) {
 
     switch (action) {
       case "get":
-        // Upstash REST: GET /get/key
         response = await fetch(`${baseUrl}/get/${encodeURIComponent(key)}`, {
-          method: "GET",
-          headers,
+          method: "GET", headers,
         });
         break;
 
       case "set":
-        // Upstash REST: POST /set/key with value in body as array [value]
+        // Store value as JSON string directly - no extra wrapping
         response = await fetch(`${baseUrl}/set/${encodeURIComponent(key)}`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify([value]),
+          method: "POST", headers,
+          body: JSON.stringify(JSON.stringify(value)),
         });
         break;
 
       case "del":
         response = await fetch(`${baseUrl}/del/${encodeURIComponent(key)}`, {
-          method: "POST",
-          headers,
+          method: "POST", headers,
         });
         break;
 
