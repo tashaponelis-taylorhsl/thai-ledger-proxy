@@ -1,14 +1,18 @@
-// api/kv.js
+// api/qbo-status.js
 // ─────────────────────────────────────────────────────────────────────────────
-// Generic KV store proxy.
-// Blocks all access to qbo_tokens: keys (server-side only).
+// Returns QuickBooks connection status for a client.
+// NEVER returns tokens — only status and metadata.
+//
+// Request:  POST { extractClientId }
+// Response: { connected: boolean, realmId?: string, expiresAt?: number }
+//
+// The access token (1 hour) is auto-refreshed silently by the proxy.
+// Only the Intuit refresh token (100 days) matters for "needs reconnect".
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const config = { runtime: "edge" };
 
 // ── Rate limiting (inlined — Edge runtime cannot import local files) ──────────
-// For kv.js there is no clientId, so we rate-limit per IP.
-// Falls back to a shared "global" bucket if IP headers are absent.
 
 async function checkRateLimit(kvBaseUrl, kvToken, key, maxRequests, windowSeconds) {
   try {
@@ -31,10 +35,18 @@ async function checkRateLimit(kvBaseUrl, kvToken, key, maxRequests, windowSecond
 
 // ── Identifier extraction ─────────────────────────────────────────────────────
 
-function getIdentifier(req) {
-  return (req.headers.get("CF-Connecting-IP")) ||
+function getIdentifier(req, body) {
+  return body?.extractClientId ||
+    body?.clientId ||
+    (req.headers.get("CF-Connecting-IP")) ||
     (req.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
-    "global";
+    "unknown";
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function tokenKey(extractClientId) {
+  return `qbo_tokens:taylorhsl:${extractClientId}`;
 }
 
 // ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -50,18 +62,14 @@ export default async function handler(req) {
 
   try {
     const body = await req.json();
-    const { action, key, value } = body;
+    const { extractClientId } = body;
 
     const baseUrl = process.env.KV_REST_API_URL;
     const token   = process.env.KV_REST_API_TOKEN;
 
-    if (!baseUrl || !token) {
-      return new Response(JSON.stringify({ error: "KV not configured" }), { status: 500, headers: corsHeaders });
-    }
-
-    // ── Rate limiting: 200 requests/min per IP ────────────────────────────────
-    const identifier = getIdentifier(req);
-    const rl = await checkRateLimit(baseUrl, token, `kv:${identifier}`, 200, 60);
+    // ── Rate limiting: 30 requests/min per extractClientId ───────────────────
+    const identifier = getIdentifier(req, body);
+    const rl = await checkRateLimit(baseUrl, token, `qbo-status:${identifier}`, 30, 60);
     if (rl.limited) {
       return new Response(JSON.stringify({
         error: "RATE_LIMIT_EXCEEDED",
@@ -70,59 +78,34 @@ export default async function handler(req) {
       }), { status: 429, headers: corsHeaders });
     }
 
-    // ── Validation: action AND key required ───────────────────────────────────
-    if (!action || !key) {
-      const missing = [];
-      if (!action) missing.push("action");
-      if (!key)    missing.push("key");
+    // ── Validation: extractClientId required ──────────────────────────────────
+    if (!extractClientId) {
       return new Response(JSON.stringify({
         error: "INVALID_REQUEST",
-        message: `Missing required fields: ${missing.join(", ")}`,
+        message: "Missing required fields: extractClientId",
       }), { status: 400, headers: corsHeaders });
     }
 
-    // ── Security: block browser access to server-side token keys ─────────────
-    if (key.startsWith("qbo_tokens:")) {
-      return new Response(JSON.stringify({ error: "Access denied" }), { status: 403, headers: corsHeaders });
+    const kvRes = await fetch(`${baseUrl}/get/${encodeURIComponent(tokenKey(extractClientId))}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const kvData = await kvRes.json();
+
+    if (!kvData.result) {
+      return new Response(JSON.stringify({ connected: false }), { headers: corsHeaders });
     }
 
-    const headers = {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json",
-    };
+    const record = typeof kvData.result === "string" ? JSON.parse(kvData.result) : kvData.result;
+    const connected = !!(record.accessToken && record.refreshToken);
+    const expiresAt = record.refreshTokenExpiry || null;
 
-    let response;
-
-    switch (action) {
-      case "get":
-        response = await fetch(`${baseUrl}/get/${encodeURIComponent(key)}`, {
-          method: "GET", headers,
-        });
-        break;
-
-      case "set":
-        // Store value as JSON string directly - no extra wrapping
-        response = await fetch(`${baseUrl}/set/${encodeURIComponent(key)}`, {
-          method: "POST", headers,
-          body: JSON.stringify(JSON.stringify(value)),
-        });
-        break;
-
-      case "del":
-        response = await fetch(`${baseUrl}/del/${encodeURIComponent(key)}`, {
-          method: "POST", headers,
-        });
-        break;
-
-      default:
-        return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400, headers: corsHeaders });
-    }
-
-    const data = await response.json();
-    return new Response(JSON.stringify(data), { status: response.status, headers: corsHeaders });
+    return new Response(JSON.stringify({
+      connected,
+      realmId:   record.realmId || null,
+      expiresAt,
+    }), { headers: corsHeaders });
 
   } catch (error) {
-    console.error("KV error:", error.message);
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: corsHeaders });
   }
 }

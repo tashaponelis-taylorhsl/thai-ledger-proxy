@@ -1,4 +1,46 @@
+// api/ms-token.js
+// ─────────────────────────────────────────────────────────────────────────────
+// Microsoft OAuth2 token exchange.
+// Exchanges an authorization code + PKCE verifier for an MS Graph access token.
+//
+// Request:  POST { clientId, tenantId, code, verifier, redirectUri, scopes }
+// Response: MS token response (access_token, refresh_token, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const config = { runtime: "edge" };
+
+// ── Rate limiting (inlined — Edge runtime cannot import local files) ──────────
+
+async function checkRateLimit(kvBaseUrl, kvToken, key, maxRequests, windowSeconds) {
+  try {
+    const rlKey   = `ratelimit:${key}`;
+    const headers = { Authorization: `Bearer ${kvToken}`, "Content-Type": "application/json" };
+
+    const incrRes  = await fetch(`${kvBaseUrl}/incr/${encodeURIComponent(rlKey)}`, { method: "POST", headers });
+    const incrData = await incrRes.json();
+    const count    = Number(incrData.result) || 1;
+
+    if (count === 1) {
+      await fetch(`${kvBaseUrl}/expire/${encodeURIComponent(rlKey)}/${windowSeconds}`, { method: "POST", headers });
+    }
+
+    return count > maxRequests ? { limited: true } : { limited: false };
+  } catch {
+    return { limited: false }; // fail open
+  }
+}
+
+// ── Identifier extraction ─────────────────────────────────────────────────────
+
+function getIdentifier(req, body) {
+  return body?.clientId ||
+    body?.extractClientId ||
+    (req.headers.get("CF-Connecting-IP")) ||
+    (req.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
+    "unknown";
+}
+
+// ── HTTP handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req) {
   const corsHeaders = {
@@ -15,21 +57,43 @@ export default async function handler(req) {
   }
 
   try {
-    const { clientId, tenantId, code, verifier, redirectUri, scopes } = await req.json();
+    const body = await req.json();
+    const { clientId, tenantId, code, verifier, redirectUri, scopes } = body;
 
-    if (!clientId || !tenantId || !code) {
-      return new Response(JSON.stringify({ 
-        error: `Missing fields: clientId=${!!clientId} tenantId=${!!tenantId} code=${!!code}`
+    const kvBaseUrl = process.env.KV_REST_API_URL;
+    const kvToken   = process.env.KV_REST_API_TOKEN;
+
+    // ── Rate limiting: 10 requests/min per clientId ───────────────────────────
+    const identifier = getIdentifier(req, body);
+    const rl = await checkRateLimit(kvBaseUrl, kvToken, `ms-token:${identifier}`, 10, 60);
+    if (rl.limited) {
+      return new Response(JSON.stringify({
+        error: "RATE_LIMIT_EXCEEDED",
+        message: "Too many requests. Please wait before retrying.",
+        retryAfter: 60,
+      }), { status: 429, headers: corsHeaders });
+    }
+
+    // ── Validation: code, redirectUri, clientId, tenantId all required ────────
+    if (!code || !redirectUri || !clientId || !tenantId) {
+      const missing = [];
+      if (!code)        missing.push("code");
+      if (!redirectUri) missing.push("redirectUri");
+      if (!clientId)    missing.push("clientId");
+      if (!tenantId)    missing.push("tenantId");
+      return new Response(JSON.stringify({
+        error: "INVALID_REQUEST",
+        message: `Missing required fields: ${missing.join(", ")}`,
       }), { status: 400, headers: corsHeaders });
     }
 
-    const body = new URLSearchParams({
-      client_id: clientId,
-      grant_type: "authorization_code",
-      code: code,
-      redirect_uri: redirectUri,
+    const tokenBody = new URLSearchParams({
+      client_id:     clientId,
+      grant_type:    "authorization_code",
+      code:          code,
+      redirect_uri:  redirectUri,
       code_verifier: verifier,
-      scope: scopes,
+      scope:         scopes,
     });
 
     const res = await fetch(
@@ -37,7 +101,7 @@ export default async function handler(req) {
       {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body.toString(),
+        body: tokenBody.toString(),
       }
     );
 
