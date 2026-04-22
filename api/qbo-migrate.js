@@ -16,11 +16,11 @@
 //   accessToken,
 //   refreshToken,
 //   tokenExpiry,      // Unix timestamp in ms
-//   qboClientId,
-//   qboClientSecret,
 //   realmId,
 //   env
 // }
+// Note: qboClientId and qboClientSecret are no longer accepted — the proxy
+// reads them from QBO_CLIENT_ID / QBO_CLIENT_SECRET env vars at refresh time.
 // Response: { success: true } or { error: string }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -81,8 +81,6 @@ export default async function handler(req) {
       accessToken,
       refreshToken,
       tokenExpiry,
-      qboClientId,
-      qboClientSecret,
       realmId,
       env,
     } = body;
@@ -101,14 +99,12 @@ export default async function handler(req) {
       }), { status: 429, headers: corsHeaders });
     }
 
-    // ── Validation: all token fields required ─────────────────────────────────
-    if (!extractClientId || !accessToken || !refreshToken || !qboClientId || !qboClientSecret) {
+    // ── Validation: token fields required (credentials come from env vars now) ──
+    if (!extractClientId || !accessToken || !refreshToken) {
       const missing = [];
-      if (!extractClientId)  missing.push("extractClientId");
-      if (!accessToken)       missing.push("accessToken");
-      if (!refreshToken)      missing.push("refreshToken");
-      if (!qboClientId)       missing.push("qboClientId");
-      if (!qboClientSecret)   missing.push("qboClientSecret");
+      if (!extractClientId) missing.push("extractClientId");
+      if (!accessToken)     missing.push("accessToken");
+      if (!refreshToken)    missing.push("refreshToken");
       return new Response(JSON.stringify({
         error: "INVALID_REQUEST",
         message: `Missing required fields: ${missing.join(", ")}`,
@@ -128,14 +124,13 @@ export default async function handler(req) {
       return new Response(JSON.stringify({ success: true, skipped: true }), { headers: corsHeaders });
     }
 
+    // Credentials intentionally not stored — proxy reads them from env vars
     const record = {
       accessToken,
       refreshToken,
       tokenExpiry:          tokenExpiry || (Date.now() + 3_600_000),
       refreshTokenExpiry:   Date.now() + (100 * 24 * 60 * 60 * 1000),
       realmId:              realmId || "",
-      qboClientId,
-      qboClientSecret,
       env:                  env || "production",
       migratedAt:           new Date().toISOString(),
     };

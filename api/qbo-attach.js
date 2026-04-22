@@ -93,15 +93,28 @@ async function getValidToken(extractClientId) {
     throw { code: "QBO_AUTH_EXPIRED", message: "No QuickBooks tokens found — please reconnect in Settings." };
   }
 
-  const { accessToken, refreshToken, tokenExpiry, qboClientId, qboClientSecret, realmId } = record;
+  // Self-heal: strip credential fields that may exist in old KV records written
+  // before this security fix. Re-save the clean record so the fields disappear.
+  let cleanRecord = record;
+  if (record.qboClientId || record.qboClientSecret) {
+    const { qboClientId: _cid, qboClientSecret: _cs, ...withoutCreds } = record;
+    cleanRecord = withoutCreds;
+    await kvSet(tokenKey(extractClientId), cleanRecord);
+  }
+
+  const { accessToken, refreshToken, tokenExpiry, realmId } = cleanRecord;
 
   const needsRefresh = !accessToken || !tokenExpiry || Date.now() > tokenExpiry - 60_000;
   if (!needsRefresh) {
     return { accessToken, realmId };
   }
 
+  // Read credentials from env vars — never from the KV record
+  const qboClientId = process.env.QBO_CLIENT_ID;
+  const qboClientSecret = process.env.QBO_CLIENT_SECRET;
+
   if (!refreshToken || !qboClientId || !qboClientSecret) {
-    throw { code: "QBO_AUTH_EXPIRED", message: "Stored credentials incomplete — please reconnect QuickBooks." };
+    throw { code: "QBO_AUTH_EXPIRED", message: "Token refresh failed — please reconnect QuickBooks." };
   }
 
   const credentials = btoa(`${qboClientId}:${qboClientSecret}`);
@@ -120,7 +133,7 @@ async function getValidToken(extractClientId) {
   }
 
   const newRecord = {
-    ...record,
+    ...cleanRecord,  // already has no credential fields
     accessToken:  data.access_token,
     refreshToken: data.refresh_token || refreshToken,
     tokenExpiry:  Date.now() + ((data.expires_in || 3600) * 1000),

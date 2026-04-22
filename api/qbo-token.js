@@ -3,16 +3,18 @@
 // QBO token exchange and server-side storage.
 //
 // Security model:
+//   QBO_CLIENT_ID and QBO_CLIENT_SECRET are read exclusively from Vercel env
+//   vars. The browser MUST NOT send clientId or clientSecret in the request
+//   body — the new flow rejects such requests with 400.
 //   Tokens are stored in Vercel KV under "qbo_tokens:taylorhsl:{extractClientId}".
-//   They are NEVER returned to the browser.  The browser only ever receives
-//   { success: true, realmId } on initial connect.
+//   No credentials are written into the KV record.
 //
-// New format:  POST { code, clientId, clientSecret, redirectUri, extractClientId, realmId, env }
+// New format:  POST { code, extractClientId, realmId, env, redirectUri }
 // Legacy flow: POST { code, clientId, clientSecret, redirectUri }  (no extractClientId)
 //              POST { grantType: "refresh_token", refreshToken, clientId, clientSecret }
 //
-// Backward compatibility: legacy flows still return tokens directly so old
-// connected clients keep working until the one-time migration runs.
+// Backward compatibility: legacy flows still return tokens directly so any
+// remaining old connected clients keep working. Remove in a later cleanup step.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const config = { runtime: "edge" };
@@ -58,27 +60,6 @@ function tokenKey(extractClientId) {
   return `qbo_tokens:taylorhsl:${extractClientId}`;
 }
 
-async function kvGet(key) {
-  const baseUrl = process.env.KV_REST_API_URL;
-  const token   = process.env.KV_REST_API_TOKEN;
-  const res = await fetch(`${baseUrl}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const data = await res.json();
-  if (!data.result) return null;
-
-  // Handle single, double, or triple encoded JSON
-  let value = data.result;
-  while (typeof value === "string") {
-    try {
-      value = JSON.parse(value);
-    } catch {
-      break;
-    }
-  }
-  return value;
-}
-
 async function kvSet(key, value) {
   const baseUrl = process.env.KV_REST_API_URL;
   const token   = process.env.KV_REST_API_TOKEN;
@@ -102,7 +83,22 @@ export default async function handler(req) {
 
   try {
     const body = await req.json();
-    const { code, clientId, clientSecret, redirectUri, refreshToken, grantType, extractClientId, realmId, env } = body;
+
+    // Destructure all expected fields. clientId and clientSecret are kept only
+    // for the legacy flows (code without extractClientId, or refresh_token grant).
+    const {
+      code, redirectUri, refreshToken, grantType, extractClientId, realmId, env,
+      clientId: legacyClientId, clientSecret: legacyClientSecret,
+    } = body;
+
+    // ── Security: reject new-flow requests that erroneously include credentials ──
+    // The new flow reads credentials from env vars — the browser must not send them.
+    if (extractClientId && (legacyClientId || legacyClientSecret)) {
+      return new Response(JSON.stringify({
+        error: "CREDENTIALS_IN_REQUEST",
+        message: "QBO credentials must not be sent from the client. The server reads them from environment variables.",
+      }), { status: 400, headers: corsHeaders });
+    }
 
     const kvBaseUrl = process.env.KV_REST_API_URL;
     const kvToken   = process.env.KV_REST_API_TOKEN;
@@ -118,22 +114,33 @@ export default async function handler(req) {
       }), { status: 429, headers: corsHeaders });
     }
 
-    // ── Validation: (code AND clientId AND clientSecret) OR (grantType AND refreshToken) ──
-    const hasCodeFlow    = !!(code && clientId && clientSecret);
-    const hasRefreshFlow = !!(grantType === "refresh_token" && refreshToken);
-    if (!hasCodeFlow && !hasRefreshFlow) {
+    // ── Validation ────────────────────────────────────────────────────────────
+    const hasNewCodeFlow     = !!(code && extractClientId);
+    const hasLegacyCodeFlow  = !!(code && !extractClientId && legacyClientId && legacyClientSecret);
+    const hasRefreshFlow     = !!(grantType === "refresh_token" && refreshToken);
+
+    if (!hasNewCodeFlow && !hasLegacyCodeFlow && !hasRefreshFlow) {
       return new Response(JSON.stringify({
         error: "INVALID_REQUEST",
-        message: "Missing required fields: provide (code + clientId + clientSecret) or (grantType='refresh_token' + refreshToken)",
+        message: "Provide (code + extractClientId) or legacy (code + clientId + clientSecret) or (grantType='refresh_token' + refreshToken)",
       }), { status: 400, headers: corsHeaders });
     }
 
-    const credentials = btoa(`${clientId}:${clientSecret}`);
+    // ── New server-side flow: read credentials from env vars ──────────────────
+    if (hasNewCodeFlow) {
+      const qboClientId = process.env.QBO_CLIENT_ID;
+      const qboClientSecret = process.env.QBO_CLIENT_SECRET;
 
-    // ── New server-side flow: exchange code and store tokens in KV ────────────
-    if (code && extractClientId) {
+      if (!qboClientId || !qboClientSecret) {
+        return new Response(JSON.stringify({
+          error: "QBO_CREDENTIALS_NOT_CONFIGURED",
+          message: "QBO credentials not configured on server — set QBO_CLIENT_ID and QBO_CLIENT_SECRET env vars",
+        }), { status: 500, headers: corsHeaders });
+      }
+
       const environment = env || "production";
       const redirect = environment === "production" ? REDIRECT_URI_PROD : REDIRECT_URI_DEV;
+      const credentials = btoa(`${qboClientId}:${qboClientSecret}`);
 
       const response = await fetch(INTUIT_TOKEN_URL, {
         method: "POST",
@@ -153,27 +160,27 @@ export default async function handler(req) {
         return new Response(JSON.stringify({ error: data.error }), { status: 400, headers: corsHeaders });
       }
 
-      // Store tokens server-side — never return them to the browser
+      // Store tokens server-side — never return them to the browser.
+      // Credentials are intentionally NOT written into the KV record;
+      // they are always read from env vars at refresh time.
       const record = {
-        accessToken:          data.access_token,
-        refreshToken:         data.refresh_token,
-        tokenExpiry:          Date.now() + ((data.expires_in || 3600) * 1000),
-        refreshTokenExpiry:   Date.now() + (100 * 24 * 60 * 60 * 1000),
-        realmId:              realmId || "",
-        qboClientId:          clientId,
-        qboClientSecret:      clientSecret,
-        env:                  environment,
+        accessToken:        data.access_token,
+        refreshToken:       data.refresh_token,
+        tokenExpiry:        Date.now() + ((data.expires_in || 3600) * 1000),
+        refreshTokenExpiry: Date.now() + (100 * 24 * 60 * 60 * 1000),
+        realmId:            realmId || "",
+        env:                environment,
       };
       await kvSet(tokenKey(extractClientId), record);
       console.log(`[qbo-token] Tokens stored server-side for ${extractClientId}, realmId: ${realmId}`);
 
-      // Return only non-sensitive data to browser
       return new Response(JSON.stringify({ success: true, realmId: realmId || "" }), { headers: corsHeaders });
     }
 
     // ── Legacy flow: authorization code exchange (returns tokens to browser) ──
     // Used by old app versions without extractClientId. Remove once all migrated.
-    if (code && !extractClientId) {
+    if (hasLegacyCodeFlow) {
+      const credentials = btoa(`${legacyClientId}:${legacyClientSecret}`);
       const response = await fetch(INTUIT_TOKEN_URL, {
         method: "POST",
         headers: {
@@ -192,7 +199,8 @@ export default async function handler(req) {
     }
 
     // ── Legacy flow: refresh token (returns new tokens to browser) ────────────
-    if (grantType === "refresh_token") {
+    if (hasRefreshFlow) {
+      const credentials = btoa(`${legacyClientId}:${legacyClientSecret}`);
       const response = await fetch(INTUIT_TOKEN_URL, {
         method: "POST",
         headers: {
